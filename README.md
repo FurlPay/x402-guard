@@ -1,5 +1,10 @@
 # x402-guard
 
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Solana](https://img.shields.io/badge/Solana-9945FF?style=flat-square&logo=solana&logoColor=white)
+![x402](https://img.shields.io/badge/x402-0052FF?style=flat-square)
+![Zero dependencies](https://img.shields.io/badge/Zero%20dependencies-4C1?style=flat-square)
+
 Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and proves it's blocked.
 
 [![npm](https://img.shields.io/npm/v/x402-guard)](https://www.npmjs.com/package/x402-guard)
