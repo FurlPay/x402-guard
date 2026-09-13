@@ -7,8 +7,6 @@
 
 Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and proves it's blocked.
 
-[![npm](https://img.shields.io/npm/v/x402-guard)](https://www.npmjs.com/package/x402-guard)
-
 Zero dependencies. TypeScript. Works on Base, Solana, or any x402 deployment — independent of which facilitator or SDK you use. Maintained by [FurlPay](https://furlpay.com).
 
 ## Why
