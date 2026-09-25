@@ -1,11 +1,8 @@
 # x402-guard
 
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Solana](https://img.shields.io/badge/Solana-9945FF?style=flat-square&logo=solana&logoColor=white)
-![x402](https://img.shields.io/badge/x402-0052FF?style=flat-square)
-![Zero dependencies](https://img.shields.io/badge/Zero%20dependencies-4C1?style=flat-square)
-
 Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and proves it's blocked.
+
+[![npm](https://img.shields.io/npm/v/x402-guard)](https://www.npmjs.com/package/x402-guard)
 
 Zero dependencies. TypeScript. Works on Base, Solana, or any x402 deployment — independent of which facilitator or SDK you use. Maintained by [FurlPay](https://furlpay.com).
 
@@ -119,24 +116,147 @@ const vmax = pricer.quoteMax(estimatedTokens);          // demand this in the 40
 pricer.observe(estimatedTokens, actualTokens);          // feed every settlement back
 ```
 
-## Redis at scale
+### F6: enforce a signed spend mandate at settlement
 
-`NonceStore` is a 4-method interface. The in-memory default is atomic within one process; for a multi-instance facilitator back `acquire` with `SET key PENDING NX` (or Postgres `INSERT … ON CONFLICT DO NOTHING`) — the atomic check-and-set maps directly.
+A mandate is a user-signed grant: this agent, up to this much per payment, up to this much per window, at these sellers, until this date. The facilitator sees every settlement, so it is the place where exceeding one can be made impossible rather than discouraged.
+
+**`reserveSpend()` takes the nonce and the window budget in one Lua script, or neither.**
 
 ```ts
-class RedisNonceStore implements NonceStore {
-  async acquire(nonce: string) {
-    return (await redis.set(`x402:${nonce}`, "pending", "NX")) === "OK";
-  }
-  async markSettled(nonce: string) { await redis.set(`x402:${nonce}`, "settled"); }
-  async release(nonce: string) { /* only if still pending */ await redis.del(`x402:${nonce}`); }
-  async state(nonce: string) { return (await redis.get(`x402:${nonce}`)) as any; }
-}
+import { RedisMandateSpendStore } from "@furlpay/x402-guard/redis";
+
+const spend = new RedisMandateSpendStore(redis);
+await spend.openWindow("mnd_1", "2026-09", 50_000_000n);   // $50, atomic
+
+const r = await spend.reserveSpend({
+  mandateId: "mnd_1", window: "2026-09", nonce, paymentHash,
+  resource: "/v1/summarize", amount: 25_000_000n,
+});
+if (!r.ok) return refuse(r.reason);   // nonce_taken | budget_exhausted | ...
+
+// settle, then:
+await spend.commit(r.reservationId);
 ```
+
+Two independent calls would leak: `budget reserved -> nonce acquire fails -> budget held forever` throws nothing anywhere, and the user's cap is simply smaller next month. `resource` is part of the reservation identity, so two endpoints at the same seller and price cannot share a slot.
+
+`releaseProvenUnsettled()` has **no timer**. It returns the budget and reopens the nonce only while that nonce is still `pending`, so a late SUCCESS can never hand a window slot back after settlement committed. A frozen budget slot is an availability problem; a wrongly-released one is a double-spend.
+
+### Window semantics are part of the signed mandate
+
+`"$50 per 30d"` is ambiguous, and the ambiguity is not cosmetic: a payer measuring a rolling 30 days and a facilitator measuring a calendar month both enforce $50 and disagree about every payment near a boundary. `WindowSpec` is a tagged union and `windowKeyFor()` is pure, so both sides derive the same bucket from the same mandate.
+
+**The type selects a storage model, not a label.** A decrementing counter cannot express a rolling window — nothing re-credits it as spend ages out of the trailing period — so `rolling` uses a timestamped ledger summed per reservation (`reserveSpendRolling`), while `calendar` and `fixed_period` use a counter.
+
+### The policy evaluator is pure
+
+`evaluateMandate()` has no Redis, no clock and no side effects; window spend is passed in. That makes every denial path testable without a network, and lets the payer-side gate run the identical function so the two layers cannot drift.
+
+All money is integer atomic units compared as `bigint`. Float USD on this boundary fails in both directions — `0.1 + 0.2 > 0.3` is `true`, which refuses a user $0.20 of a $0.30 cap they hold.
+
+```ts
+import { evaluateMandate } from "@furlpay/x402-guard/policy";
+
+const verdict = evaluateMandate({ policy, authorization, windowSpentAtomic, approval, nowMs });
+// { allowed, reason?, requiresApproval, policyVersion, evaluated }
+```
+
+Step-up approval evidence (the signature half) lives in [`@furlpay/agent-trust`](https://github.com/FurlPay/agent-trust), which holds the keys; this package takes `verified` as an input and stays pure.
+
+## Redis at scale
+
+Every atomicity guarantee the in-memory stores make rests on Node being single-threaded — `MemoryNonceStore.acquire` is safe only because no `await` sits between its read and its write. That is real, and it is worth nothing across two workers, two lambdas or two regions, which is how facilitators actually run. **The F2 race the paper reproduces is a race between machines.**
+
+`@furlpay/x402-guard/redis` ships multi-process implementations of the same interfaces:
+
+```ts
+import {
+  RedisNonceStore, RedisAllowanceStore, RedisSettlementCapacityLimiter,
+  fromUpstashRest, // or fromIoRedis / fromNodeRedis
+} from "@furlpay/x402-guard";
+
+const redis = fromUpstashRest(process.env.UPSTASH_REDIS_REST_URL!, process.env.UPSTASH_REDIS_REST_TOKEN!);
+
+await guardedSettle(req, {
+  nonce,
+  store: new RedisNonceStore(redis),
+  capacity: new RedisSettlementCapacityLimiter(redis, 32),
+  settler,
+});
+```
+
+**Still zero dependencies.** The client is injected, not imported — anything that can send one Redis command and return its reply works. Adapters for Upstash REST, ioredis and node-redis are included; a fourth is three lines.
+
+Each operation is one round trip whose atomicity is Redis's, not ours — either a natively atomic command (`SET … NX`) or a single Lua script. Three details are load-bearing:
+
+- **`release` is a compare-and-delete, not a `DEL`.** A stray release arriving after a nonce reached `SETTLED` would reopen a spent authorization for replay — exactly the hole the paper documents. A `DEL` cannot tell the two states apart, so the check and the delete must be one script.
+- **Capacity is a lease-scored sorted set, not a counter.** An `INCR`/`DECR` counter leaks a slot permanently when a worker dies holding one, and a facilitator that slowly starves itself into refusing everything has inflicted F4 on itself. Holders are entries scored by acquisition time; each reservation first evicts anything past its lease, so a crashed worker's slot is reclaimed automatically.
+- **Amounts above 2^53 are refused, not rounded.** Redis Lua numbers are IEEE doubles, so in-script integer arithmetic is exact only below that. For 6-decimal USDC this permits ~9 billion; larger allowances need a bigint-safe backend, and failing loudly is the only honest option.
+
+### What is actually verified
+
+| Suite | Runs the Lua? | Real processes? |
+| --- | --- | --- |
+| `npm test` → `redis-stores.test.mjs` | ❌ JS twins behind a test double | ❌ one process |
+| `npm run test:redis` | ✅ | ❌ one process |
+| `npm run mp` | ✅ | ✅ N OS processes |
+
+The default suite runs the stores against a double that interleaves callers between commands and serialises them within a script — Redis's two relevant properties. It catches store-logic and sequencing bugs and **cannot catch a bug in the Lua, because the Lua never runs.** The double keys its stand-ins off a *hash* of each script, so editing the Lua makes the lookup miss and the double throw, rather than quietly testing stale logic.
+
+`npm run mp` is the run to cite. Each worker is a real OS process with its own heap and event loop, sharing nothing but Redis, all aligned to a common start timestamp so their attempts genuinely overlap:
+
+```
+8 OS processes x 25 attempts, sharing nothing but Redis
+
+F2  exactly one acquire succeeds fleet-wide  (of 200 concurrent)
+F3  reservations granted = allowance / vmax; total charged never exceeds the allowance
+F4  slots admitted fleet-wide = the ceiling, while every winner still holds
+```
+
+Both Redis suites **skip** when no server is configured, so a green run on a laptop with no Redis is never mistaken for evidence.
 
 ## Test suite
 
 `npm test` reproduces every attack and asserts it fails: the F2 20-concurrent-request race (the paper's Base reproduction — exactly one settles, the settler runs exactly once), the F3 overdraft (20 concurrent charges against one allowance — exactly ⌊balance/Vmax⌋ served, balance never negative), the F4 flood (overflow refused *before* delivery, authorizations left intact for retry), and F5 convergence (a 5× compute free-rider is fully covered after adaptation, with the learned ratio clamped at both ends).
+
+## Adversarial evaluation
+
+The test suite above shows the defenses refusing bad traffic. That is necessary but not sufficient evidence: a component that refuses *everything* passes every defense test. `harness/` measures the thing that actually matters — how much service leaks with and without the guard, under the same attack.
+
+```sh
+npm run build && npm run harness     # results table
+npm run harness:json                 # machine-readable
+npm run sweep                        # F5 parameter frontier
+```
+
+Both facilitators settle against a shared `SimulatedChain` that consumes an authorization exactly once, mirroring EIP-3009 `authorizationState`. The merchant loop is x402's real shape — `verify()` off-chain, **deliver**, `settle()` on-chain — so every flaw lives in the gap the protocol actually has.
+
+Resource-leakage ratio, seed 42:
+
+| Flaw | Invariant | Unguarded | Guarded |
+| --- | --- | --- | --- |
+| **F1** Cross-resource substitution | I3 | **75.0%** — 4 siblings served, 1 paid | **0%** (3 refused at admission) |
+| **F2** Duplicate-settlement race | I4 | **95.0%** — 20 served, chain consumed 1 | **0%** (19 refused) |
+| **F3** Allowance overdraft | I5 | **50.0%** value — drew 1000 on a 500 allowance (**2.00×**) | **0%** (**1.00×**) |
+| **F4** Denial of settlement | I2 | **75.0%** — 12 served, 3 settled | **0%** (9 refused) |
+| **F5** Hidden-compute pricing | G2 | **68.8%** value — 8,609 of 12,507 units free-ridden | **33.9%** — 4,244 units |
+
+F1–F4 close completely. **F5 does not, and is reported as a mitigation rather than a fix** — the paper itself notes there is no static defense when the true cost is unknowable at quote time. `npm run sweep` maps the frontier:
+
+| Safety margin | Value leakage | Honest over-escrow |
+| --- | --- | --- |
+| 1.0 | 43.5% | 3.3× |
+| 1.25 (default) | 33.9% | 4.1× |
+| 2.0 | 11.9% | 6.6× |
+| 4.0 | 1.6% | 13.2× |
+| 6.0 | **0.0%** | **19.8×** |
+
+Leakage *can* be driven to zero, but only by escrowing ~20× an honest caller's eventual bill. Honest callers are quoted against an average that includes the abusers, so they subsidise the unpredictability — refunded at commit, but locked until then. Choosing a margin is choosing where on that curve to sit; the default sits deliberately near the cheap end.
+
+Two guards keep the numbers honest, and both fail the build if violated:
+
+- **Control** — every unguarded baseline must still be exploitable. If a scenario drifts and the baseline stops leaking, the guarded 0% proves nothing, so the suite fails rather than reporting a comfortable result.
+- **Liveness** — the guarded facilitator must still deliver *and* settle honest traffic in every scenario. Without this, `verify() { return false }` would score a perfect zero.
 
 ## Scope
 

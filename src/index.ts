@@ -49,6 +49,10 @@
 
 import crypto from "crypto";
 
+// Multi-process implementations of the same interfaces. The type-only imports
+// in that module are erased, so re-exporting here creates no runtime cycle.
+export * from "./redis.js";
+
 // ── F1: Cryptographic Context Binding (paper §5.1) ─────────────────────────
 
 /**
@@ -78,8 +82,8 @@ export function verifyRequestBinding(
 ): boolean {
   if (!presentedBinding) return false;
   const expected = requestBindingHash(method, uri, body);
-  const a = Buffer.from(expected);
-  const b = Buffer.from(presentedBinding);
+  const a = new Uint8Array(Buffer.from(expected));
+  const b = new Uint8Array(Buffer.from(presentedBinding));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
@@ -147,6 +151,18 @@ export interface GuardResult {
   reason?: string;
 }
 
+/** Releases a held capacity slot. Idempotent, so a `finally` can always call it. */
+export type CapacityRelease = () => void | Promise<void>;
+
+/**
+ * A capacity gate. Deliberately an interface rather than the concrete class:
+ * the in-process limiter is synchronous, but a Redis-backed one has to await a
+ * round trip, and `guardedSettle` must work with either.
+ */
+export interface CapacityLimiter {
+  tryReserve(): CapacityRelease | null | Promise<CapacityRelease | null>;
+}
+
 export interface GuardOptions<TReq> {
   nonce: string;
   store: NonceStore;
@@ -154,7 +170,7 @@ export interface GuardOptions<TReq> {
   /** Optional F1 binding check — supply the request context to enforce it. */
   binding?: { presented: string | undefined; method: string; uri: string; body?: string | Buffer };
   /** Optional F4 gate — settlement capacity is reserved before the nonce is claimed. */
-  capacity?: SettlementCapacityLimiter;
+  capacity?: CapacityLimiter;
 }
 
 // ── F4: Failure-Closed Capacity Reservation (paper §5.4) ───────────────────
@@ -171,7 +187,7 @@ export interface GuardOptions<TReq> {
  * process. For a multi-instance facilitator, map it onto Redis `INCR` with a
  * bound check (DECR on release), same shape as the NonceStore.
  */
-export class SettlementCapacityLimiter {
+export class SettlementCapacityLimiter implements CapacityLimiter {
   private inFlightCount = 0;
 
   constructor(private readonly maxConcurrent: number) {
@@ -220,7 +236,9 @@ export async function guardedSettle<TReq>(req: TReq, opts: GuardOptions<TReq>): 
 
   // F4: reserve settlement capacity before touching the nonce, so a rejected
   // request leaves the authorization intact for an honest retry (map to 429).
-  const releaseCapacity = capacity ? capacity.tryReserve() : undefined;
+  // `await` here is what lets a Redis-backed limiter participate: awaiting the
+  // synchronous in-process limiter's return value is a no-op.
+  const releaseCapacity = capacity ? await capacity.tryReserve() : undefined;
   if (capacity && !releaseCapacity) {
     return { success: false, reason: "settlement_capacity_exhausted" };
   }
@@ -252,7 +270,7 @@ export async function guardedSettle<TReq>(req: TReq, opts: GuardOptions<TReq>): 
     // unknown: do NOT release — a later confirmation must not be replayable.
     return { success: false, reason: "settlement_unknown_locked" };
   } finally {
-    releaseCapacity?.();
+    await releaseCapacity?.();
   }
 }
 
