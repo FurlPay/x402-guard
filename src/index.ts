@@ -42,7 +42,7 @@
 //          ratio (EWMA) and quote Vmax = estimate × ratio × margin — feed it
 //          into the F3 escrow so honest callers get the overshoot refunded.
 //
-// Zero dependencies. The nonce store is an interface: the in-memory default is
+// No runtime dependencies. The nonce store is an interface: the in-memory default is
 // correct within one process; back it with Redis SETNX for multi-instance
 // facilitators (the atomic check-and-set maps directly).
 // ---------------------------------------------------------------------------
