@@ -1,14 +1,28 @@
-# x402-guard
+# @furlpay/x402-guard
 
-Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and proves it's blocked.
+Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant for enforcement mechanisms against all five implementation flaw classes described in the security literature — with a test suite that reproduces each attack and asserts the defense refuses it under the tested conditions.
 
-[![npm](https://img.shields.io/npm/v/x402-guard)](https://www.npmjs.com/package/x402-guard)
+[![npm](https://img.shields.io/npm/v/@furlpay/x402-guard)](https://www.npmjs.com/package/@furlpay/x402-guard)
 
-Zero dependencies. TypeScript. Works on Base, Solana, or any x402 deployment — independent of which facilitator or SDK you use. Maintained by [FurlPay](https://furlpay.com).
+Zero runtime dependencies (`@types/node` is an optional peer, for TypeScript consumers only). TypeScript. Works on Base, Solana, or any x402 deployment — independent of which facilitator or SDK you use. Maintained by [FurlPay](https://furlpay.com).
+
+## Status
+
+**Published on npm: `0.2.0`.** The badge above tracks it.
+
+`0.3.0` is prepared but **not released** — it adds the mandate / spend-control
+surface (`/redis`, `/mandate`, `/policy`) documented below. Until it is published,
+those entry points are available from the repository, not from npm. Anything in
+this README describing them describes the next release.
+
+No third-party security audit has been performed on this package. What exists is
+the test suite described under [Test suite](#test-suite) and
+[Adversarial evaluation](#adversarial-evaluation), including the honest account of
+what the default suite cannot catch.
 
 ## Why
 
-x402 decouples off-chain verification from on-chain settlement to get throughput. That gap is where the money leaks. *Free-Riding the Agentic Web: A Systematic Security Analysis of x402 Payments* ([Ling et al., arXiv:2605.30998](https://arxiv.org/abs/2605.30998)) tested official SDKs and a production deployment and found **resource-leakage ratios up to 100%**. This library implements the paper's defenses for all five flaw classes:
+x402 decouples off-chain verification from on-chain settlement to get throughput. That gap is where the money leaks. *Free-Riding the Agentic Web: A Systematic Security Analysis of x402 Payments* ([Ling et al., arXiv:2605.30998](https://arxiv.org/abs/2605.30998)) tested official SDKs and a production deployment and found **resource-leakage ratios up to 100%**. This library implements the paper's defenses for all five flaw classes. What the suite demonstrates is refusal under the conditions it tests — see [What is actually verified](#what-is-actually-verified) for exactly which of these are exercised against real Redis and real processes, and which are not:
 
 | Flaw | Invariant | What goes wrong | This library |
 | --- | --- | --- | --- |
@@ -21,15 +35,35 @@ x402 decouples off-chain verification from on-chain settlement to get throughput
 ## Install
 
 ```sh
-npm install x402-guard
+npm install @furlpay/x402-guard
 ```
+
+The package is **scoped**. `npm install x402-guard` — which this README used to
+say — resolves to nothing: the unscoped name is not published. Check the `@furlpay/`
+prefix before installing anything that claims to be this package.
+
+ESM only (`"type": "module"`); there is no CommonJS entry point, so `require()`
+will fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Node 18+.
+
+TypeScript consumers should have `@types/node` installed — `Buffer` appears in
+the public type surface. It is declared as an optional peer, so npm will tell you
+rather than leaving you with an error inside our declarations.
+
+### Entry points
+
+| Import | Contains |
+|---|---|
+| `@furlpay/x402-guard` | `guardedSettle`, `guardedCharge`, the in-memory stores, `requestBindingHash` |
+| `@furlpay/x402-guard/redis` | `RedisNonceStore`, `RedisAllowanceStore`, `RedisMandateSpendStore`, `RedisSettlementCapacityLimiter` |
+| `@furlpay/x402-guard/mandate` | `WindowSpec`, `windowKeyFor()`, `evaluateSpendAuthorization()` |
+| `@furlpay/x402-guard/policy` | `SettlementAuthorization`, `evaluateMandate()` |
 
 ## Use
 
 Wrap your settler with `guardedSettle`. It runs the F1 binding gate first (no wasted compute on a bad request), then the F2 atomic nonce claim, then your settler — releasing the nonce only when the chain *proves* nothing landed.
 
 ```ts
-import { guardedSettle, MemoryNonceStore } from "x402-guard";
+import { guardedSettle, MemoryNonceStore } from "@furlpay/x402-guard";
 
 const store = new MemoryNonceStore(); // swap for a Redis-backed store at scale
 
@@ -68,7 +102,7 @@ A naïve facilitator deletes the nonce when settlement "fails" — but a facilit
 `guardedCharge` escrows `Vmax` atomically before your handler runs, bills what the handler reports, and refunds the difference. Concurrent requests can never spend more than the allowance holds.
 
 ```ts
-import { MemoryAllowanceStore, guardedCharge } from "x402-guard";
+import { MemoryAllowanceStore, guardedCharge } from "@furlpay/x402-guard";
 
 const allowances = new MemoryAllowanceStore();
 allowances.create(auth.allowanceId, auth.totalAuthorized); // on receipt of the signed upto authorization
@@ -92,7 +126,7 @@ else refuse(res.reason);             // "allowance_exhausted" | "execution_faile
 Pass a `SettlementCapacityLimiter` to `guardedSettle` and capacity is reserved *before* the nonce is claimed or your settler runs. When the settlement path is saturated (or under attack), overflow requests get `settlement_capacity_exhausted` — map it to HTTP 429. The refused authorization is untouched, so an honest client simply retries.
 
 ```ts
-import { SettlementCapacityLimiter } from "x402-guard";
+import { SettlementCapacityLimiter } from "@furlpay/x402-guard";
 
 const capacity = new SettlementCapacityLimiter(32); // concurrent settlements you can actually clear
 
@@ -107,7 +141,7 @@ if (!result.success && result.reason === "settlement_capacity_exhausted") {
 For pay-per-token inference the true cost is unknown at quote time — no static price is safe. `AdaptivePricer` learns the observed actual/estimated ratio (EWMA, clamped) and quotes a `Vmax` with enough headroom to cover it. Compose it with the F3 escrow: free-riders stop leaking once the weight adapts, and honest callers get the overshoot refunded at commit.
 
 ```ts
-import { AdaptivePricer } from "x402-guard";
+import { AdaptivePricer } from "@furlpay/x402-guard";
 
 const pricer = new AdaptivePricer({ unitPrice: 10n }); // atomic units per output token
 
@@ -218,6 +252,17 @@ Both Redis suites **skip** when no server is configured, so a green run on a lap
 ## Test suite
 
 `npm test` reproduces every attack and asserts it fails: the F2 20-concurrent-request race (the paper's Base reproduction — exactly one settles, the settler runs exactly once), the F3 overdraft (20 concurrent charges against one allowance — exactly ⌊balance/Vmax⌋ served, balance never negative), the F4 flood (overflow refused *before* delivery, authorizations left intact for retry), and F5 convergence (a 5× compute free-rider is fully covered after adaptation, with the learned ratio clamped at both ends).
+
+The F6 mandate suites (unreleased, in `0.3.0`) cover the same ground for spend
+control: ten agents racing one window with exactly four winners and the balance
+landing on zero, a budget rejection that must not burn the nonce, a release that
+refuses once the nonce has settled, and rolling-window spend ageing out so a
+capped window accepts a full-cap payment 31 days later with nobody topping it up.
+
+Counts, so they are not inflated: **117 tests, 112 passing, 0 failing, 5 skipped.**
+The five skips are the Redis integration suite, which skips itself when no server
+is configured — see the table above. `112/117` is not `117/117`, and a green local
+run without Redis is not evidence about the Lua.
 
 ## Adversarial evaluation
 

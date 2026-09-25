@@ -1,7 +1,7 @@
 {
   "name": "@furlpay/x402-guard",
-  "version": "0.2.0",
-  "description": "Facilitator-layer hardening for x402 agentic payments \u2014 closes all five flaw classes from arXiv:2605.30998: cross-resource substitution, duplicate-settlement race, allowance overdraft, denial of settlement, hidden-compute pricing",
+  "version": "0.3.0",
+  "description": "Facilitator-layer hardening for x402 agentic payments — enforcement mechanisms against the five flaw classes from arXiv:2605.30998: cross-resource substitution, duplicate-settlement race, allowance overdraft, denial of settlement, hidden-compute pricing. Zero runtime dependencies.",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",

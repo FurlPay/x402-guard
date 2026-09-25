@@ -14,7 +14,7 @@
 // not ours: either one command that is natively atomic (`SET NX`), or one Lua
 // script, which Redis executes to completion without interleaving.
 //
-// STILL ZERO DEPENDENCIES. The client is injected, not imported. Anything that
+// STILL NO RUNTIME DEPENDENCIES. The client is injected, not imported. Anything that
 // can send one Redis command and return its reply works — Upstash's REST
 // endpoint, ioredis, node-redis. Adapters for all three are at the bottom; a
 // fourth is three lines.
