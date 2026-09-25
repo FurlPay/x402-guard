@@ -1,10 +1,24 @@
 # @furlpay/x402-guard
 
-Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and proves it's blocked.
+Vendor-neutral facilitator-layer hardening for the [x402](https://www.x402.org) agentic payment protocol. Drop it into any x402 facilitator or merchant to close all five implementation flaw classes from the security literature — with a test suite that reproduces each attack and asserts the defense refuses it.
 
 [![npm](https://img.shields.io/npm/v/@furlpay/x402-guard)](https://www.npmjs.com/package/@furlpay/x402-guard)
 
 Zero dependencies. TypeScript. Works on Base, Solana, or any x402 deployment — independent of which facilitator or SDK you use. Maintained by [FurlPay](https://furlpay.com).
+
+## Status
+
+**Published on npm: `0.2.0`.** The badge above tracks it.
+
+`0.3.0` is prepared but **not released** — it adds the mandate / spend-control
+surface (`/redis`, `/mandate`, `/policy`) documented below. Until it is published,
+those entry points are available from the repository, not from npm. Anything in
+this README describing them describes the next release.
+
+No third-party security audit has been performed on this package. What exists is
+the test suite described under [Test suite](#test-suite) and
+[Adversarial evaluation](#adversarial-evaluation), including the honest account of
+what the default suite cannot catch.
 
 ## Why
 
@@ -238,6 +252,17 @@ Both Redis suites **skip** when no server is configured, so a green run on a lap
 ## Test suite
 
 `npm test` reproduces every attack and asserts it fails: the F2 20-concurrent-request race (the paper's Base reproduction — exactly one settles, the settler runs exactly once), the F3 overdraft (20 concurrent charges against one allowance — exactly ⌊balance/Vmax⌋ served, balance never negative), the F4 flood (overflow refused *before* delivery, authorizations left intact for retry), and F5 convergence (a 5× compute free-rider is fully covered after adaptation, with the learned ratio clamped at both ends).
+
+The F6 mandate suites (unreleased, in `0.3.0`) cover the same ground for spend
+control: ten agents racing one window with exactly four winners and the balance
+landing on zero, a budget rejection that must not burn the nonce, a release that
+refuses once the nonce has settled, and rolling-window spend ageing out so a
+capped window accepts a full-cap payment 31 days later with nobody topping it up.
+
+Counts, so they are not inflated: **117 tests, 112 passing, 0 failing, 5 skipped.**
+The five skips are the Redis integration suite, which skips itself when no server
+is configured — see the table above. `112/117` is not `117/117`, and a green local
+run without Redis is not evidence about the Lua.
 
 ## Adversarial evaluation
 
